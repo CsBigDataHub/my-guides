@@ -796,3 +796,875 @@ HEADER DIRECTIVES
 //DESCRIPTION My script              Script description
 //GAV com.example:tool:1.0          Maven coordinates for publishing
 ```
+
+
+# Private Maven Repositories with JBang: Comprehensive Guide
+
+---
+
+## Why This Matters
+
+Most JBang tutorials only show `mavencentral` dependencies. But in the real world, your company almost certainly has:
+
+- An **internal Nexus or Artifactory** instance hosting proprietary libraries
+- **Snapshot repositories** for pre-release artifacts
+- **GitHub Packages** for org-level artifact sharing
+- A **mirror** that proxies Maven Central for security/compliance reasons
+
+Getting credentials wrong means your script silently falls back to Maven Central (and fails with "artifact not found"), or worse — leaks credentials into logs or source control.
+
+This guide covers every approach, when to use each one, and the exact pitfalls to avoid.
+
+---
+
+## Understanding How JBang Resolves Dependencies
+
+Before diving into configuration, it helps to know what JBang is doing under the hood.
+
+JBang uses **Grape/Ivy** (not Maven) for dependency resolution, but it respects Maven conventions. When you write:
+
+```java
+//DEPS com.mycompany:internal-sdk:2.1.0
+//REPOS myrepo=https://nexus.mycompany.com/repository/maven-public
+```
+
+JBang will:
+1. Check its local cache (`~/.jbang/cache/`) first
+2. Try each listed repository in order
+3. Download and cache the artifact if found
+4. Fail with a resolution error if nothing is found anywhere
+
+The `//REPOS` line controls **where** JBang looks. The credentials control **whether** it can authenticate to get there.
+
+```
+Script Header         JBang             Nexus/Artifactory
+─────────────         ─────             ─────────────────
+//REPOS myrepo=... ──► resolves ──────► authenticates with
+//DEPS com.x:y:1.0     coordinates      env vars / settings.xml
+                       checks cache     downloads artifact
+                       ◄─────────────── returns jar
+```
+
+---
+
+## Approach 1: Environment Variables in Script Header
+
+This is the **JBang-native approach**. Credentials never touch the script itself — they live in environment variables that JBang reads at runtime using the `@env.VAR` syntax.
+
+### Basic Syntax
+
+```java
+//REPOS id=https://host/repo@env.USERNAME_VAR:env.PASSWORD_VAR
+```
+
+Breaking that down:
+- `id` — arbitrary name, used internally for repo identity
+- `https://host/repo` — the repository URL
+- `@` — separator between URL and credentials
+- `env.USERNAME_VAR` — reads from environment variable `USERNAME_VAR`
+- `env.PASSWORD_VAR` — reads from environment variable `PASSWORD_VAR`
+
+### Full Working Example
+
+```java
+///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 21
+
+// ─── REPOSITORIES ───────────────────────────────────────────────────────────
+// Always include mavencentral explicitly when adding custom repos,
+// otherwise JBang may not fall back to it for public dependencies.
+//REPOS mavencentral,mycompany=https://nexus.mycompany.com/repository/maven-public@env.NEXUS_USER:env.NEXUS_PASS
+
+// ─── DEPENDENCIES ───────────────────────────────────────────────────────────
+// Public deps (resolved from mavencentral)
+//DEPS com.google.code.gson:gson:2.10.1
+//DEPS org.slf4j:slf4j-simple:2.0.9
+
+// Private deps (resolved from mycompany repo)
+//DEPS com.mycompany:internal-sdk:2.1.0
+//DEPS com.mycompany:data-models:1.5.3
+
+import com.mycompany.sdk.ApiClient;
+import com.google.gson.Gson;
+
+void main() {
+    var client = new ApiClient("https://api.internal.mycompany.com");
+    System.out.println("Connected: " + client.ping());
+}
+```
+
+### Setting Up Environment Variables Locally
+
+**Linux / macOS — temporary (current session only):**
+
+```bash
+export NEXUS_USER=john.smith
+export NEXUS_PASS=supersecret123
+
+# Verify they're set
+echo $NEXUS_USER
+
+# Now run your script
+jbang myapp.java
+```
+
+**Linux / macOS — permanent (all sessions):**
+
+```bash
+# Add to your shell profile
+# For bash:
+echo 'export NEXUS_USER=john.smith'  >> ~/.bashrc
+echo 'export NEXUS_PASS=supersecret123' >> ~/.bashrc
+source ~/.bashrc
+
+# For zsh (default on modern macOS):
+echo 'export NEXUS_USER=john.smith'  >> ~/.zshrc
+echo 'export NEXUS_PASS=supersecret123' >> ~/.zshrc
+source ~/.zshrc
+```
+
+**Windows — PowerShell permanent:**
+
+```powershell
+# Set for current user (persists across sessions)
+[Environment]::SetEnvironmentVariable("NEXUS_USER", "john.smith", "User")
+[Environment]::SetEnvironmentVariable("NEXUS_PASS", "supersecret123", "User")
+
+# Verify
+[Environment]::GetEnvironmentVariable("NEXUS_USER", "User")
+
+# Restart terminal or reload
+$env:NEXUS_USER = [Environment]::GetEnvironmentVariable("NEXUS_USER", "User")
+```
+
+**Windows — Command Prompt:**
+
+```cmd
+:: Temporary
+set NEXUS_USER=john.smith
+set NEXUS_PASS=supersecret123
+
+:: Permanent (requires admin for system-wide)
+setx NEXUS_USER "john.smith"
+setx NEXUS_PASS "supersecret123"
+```
+
+### What Happens If Variables Are Missing?
+
+If `NEXUS_USER` or `NEXUS_PASS` aren't set, JBang will attempt an **unauthenticated request** to the repository. Depending on your Nexus/Artifactory configuration this will either:
+- Return 401 Unauthorized → JBang fails with resolution error
+- Return public artifacts only → private artifacts "not found"
+
+You won't get a helpful "credentials missing" error by default. To catch this early, add a guard at the top of your script:
+
+```java
+///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 21
+//REPOS mavencentral,mycompany=https://nexus.mycompany.com/repository/maven-public@env.NEXUS_USER:env.NEXUS_PASS
+//DEPS com.mycompany:internal-sdk:2.1.0
+
+void main() {
+    // Guard: fail fast with a clear message if credentials missing
+    var user = System.getenv("NEXUS_USER");
+    var pass = System.getenv("NEXUS_PASS");
+
+    if (user == null || user.isBlank()) {
+        System.err.println("ERROR: NEXUS_USER environment variable is not set.");
+        System.err.println("Run: export NEXUS_USER=your-username");
+        System.exit(1);
+    }
+    if (pass == null || pass.isBlank()) {
+        System.err.println("ERROR: NEXUS_PASS environment variable is not set.");
+        System.err.println("Run: export NEXUS_PASS=your-password");
+        System.exit(1);
+    }
+
+    // ... actual script logic
+    System.out.println("Credentials present, proceeding...");
+}
+```
+
+> **Note:** The guard runs *after* dependency resolution, so it won't prevent the resolution failure — but it will give your team a clear error message the next time they run the script without the right environment setup. For a pre-resolution check you need a wrapper shell script (see [Shell Wrapper Pattern](#shell-wrapper-pattern)).
+
+---
+
+## Approach 2: Maven settings.xml
+
+Maven's `settings.xml` is the **most portable approach** — it works with Maven, Gradle, and JBang all at once, so if your team already uses Maven you may already have this set up.
+
+JBang automatically reads `~/.m2/settings.xml` when resolving dependencies.
+
+### File Location
+
+```
+~/.m2/settings.xml          ← user-level (recommended)
+/etc/maven/settings.xml     ← system-level (all users on machine)
+```
+
+### Full settings.xml Example
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                              http://maven.apache.org/xsd/settings-1.0.0.xsd">
+
+  <!-- ─── SERVER CREDENTIALS ─────────────────────────────────────────────── -->
+  <!-- The <id> here must match the <id> in your repositories section below   -->
+  <servers>
+
+    <server>
+      <id>mycompany-releases</id>
+      <username>john.smith</username>
+      <password>supersecret123</password>
+    </server>
+
+    <server>
+      <id>mycompany-snapshots</id>
+      <username>john.smith</username>
+      <password>supersecret123</password>
+    </server>
+
+    <!-- GitHub Packages uses your GitHub username + a Personal Access Token -->
+    <server>
+      <id>github-packages</id>
+      <username>johngithub</username>
+      <password>ghp_xxxxxxxxxxxxxxxxxxxx</password>
+    </server>
+
+  </servers>
+
+  <!-- ─── PROFILES ────────────────────────────────────────────────────────── -->
+  <profiles>
+    <profile>
+      <id>company-repos</id>
+      <repositories>
+
+        <repository>
+          <id>mycompany-releases</id>
+          <name>MyCompany Releases</name>
+          <url>https://nexus.mycompany.com/repository/maven-releases</url>
+          <releases>
+            <enabled>true</enabled>
+          </releases>
+          <snapshots>
+            <enabled>false</enabled>
+          </snapshots>
+        </repository>
+
+        <repository>
+          <id>mycompany-snapshots</id>
+          <name>MyCompany Snapshots</name>
+          <url>https://nexus.mycompany.com/repository/maven-snapshots</url>
+          <releases>
+            <enabled>false</enabled>
+          </releases>
+          <snapshots>
+            <enabled>true</enabled>
+            <!-- Check for new snapshots daily -->
+            <updatePolicy>daily</updatePolicy>
+          </snapshots>
+        </repository>
+
+        <repository>
+          <id>github-packages</id>
+          <name>GitHub Packages - MyOrg</name>
+          <url>https://maven.pkg.github.com/myorg/myrepo</url>
+        </repository>
+
+      </repositories>
+    </profile>
+  </profiles>
+
+  <!-- ─── ACTIVATE PROFILE ────────────────────────────────────────────────── -->
+  <activeProfiles>
+    <activeProfile>company-repos</activeProfile>
+  </activeProfiles>
+
+</settings>
+```
+
+### Using It in Scripts
+
+When you have `settings.xml` configured, your script headers become **much cleaner** — no credentials, no repo URLs:
+
+```java
+///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 21
+
+// No //REPOS needed at all — JBang picks up everything from settings.xml
+//DEPS com.google.code.gson:gson:2.10.1
+//DEPS com.mycompany:internal-sdk:2.1.0
+//DEPS com.mycompany:data-models:1.5.3-SNAPSHOT
+
+void main() {
+    System.out.println("Resolved from private repo via settings.xml");
+}
+```
+
+This is ideal for teams: everyone configures their own `settings.xml` locally with their own credentials, and the scripts stay credential-free and shareable.
+
+### Encrypting Passwords in settings.xml
+
+Storing plaintext passwords in `settings.xml` is uncomfortable. Maven has a built-in password encryption mechanism:
+
+```bash
+# Step 1: Create a master password
+mvn --encrypt-master-password
+# Enter your master password when prompted
+# Outputs something like: {jSMOWnoPFgsHVpMvz5VrIt5kRbzGpI8u+9EF1iFQyJQ=}
+
+# Step 2: Store it in ~/.m2/settings-security.xml
+cat > ~/.m2/settings-security.xml << 'EOF'
+<settingsSecurity>
+  <master>{jSMOWnoPFgsHVpMvz5VrIt5kRbzGpI8u+9EF1iFQyJQ=}</master>
+</settingsSecurity>
+EOF
+
+# Step 3: Encrypt your actual password
+mvn --encrypt-password
+# Enter your Nexus/Artifactory password when prompted
+# Outputs: {COQLCE6DU6GtcS5P=}
+
+# Step 4: Use the encrypted form in settings.xml
+```
+
+```xml
+<server>
+  <id>mycompany-releases</id>
+  <username>john.smith</username>
+  <password>{COQLCE6DU6GtcS5P=}</password>  <!-- encrypted -->
+</server>
+```
+
+---
+
+## Approach 3: JBang Global Config
+
+JBang has its own config system that lives at `~/.jbang/jbang.properties`. This is the lightest-weight option for simple cases.
+
+```bash
+# Add a repo to global JBang config
+jbang config set repo.mycompany https://nexus.mycompany.com/repository/maven-public
+
+# This adds to ~/.jbang/jbang.properties:
+# repo.mycompany=https://nexus.mycompany.com/repository/maven-public
+
+# View all config
+jbang config list
+
+# Remove a repo
+jbang config unset repo.mycompany
+```
+
+This approach **does not support credentials** — it's only useful for unauthenticated repositories (internal mirrors on a VPN, for example). For authenticated repos, use the `@env.` syntax or `settings.xml`.
+
+```java
+// Script using globally configured repo — no //REPOS header needed
+///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 21
+//DEPS com.mycompany:internal-lib:1.0.0
+
+void main() {
+    System.out.println("Repo comes from jbang global config");
+}
+```
+
+---
+
+## GitHub Actions: Complete Workflows
+
+### Approach A: Environment Variables from Secrets
+
+The simplest approach. Store credentials as GitHub secrets, pass them as env vars, use `@env.` syntax in the script.
+
+**1. Add secrets to your repo:**
+
+```
+GitHub repo → Settings → Secrets and variables → Actions → New repository secret
+
+NEXUS_URL  = https://nexus.mycompany.com/repository/maven-public
+NEXUS_USER = ci-service-account
+NEXUS_PASS = ci-token-or-password
+```
+
+**2. Workflow file:**
+
+```yaml
+# .github/workflows/run-script.yml
+name: Run JBang Script
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:  # allow manual trigger
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JBang
+        uses: jbangdev/setup-jbang@main
+
+      # Cache JBang dependency downloads between runs
+      - name: Cache JBang dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.jbang/cache
+          key: jbang-${{ runner.os }}-${{ hashFiles('**/*.java') }}
+          restore-keys: |
+            jbang-${{ runner.os }}-
+
+      - name: Run script
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+        run: jbang myapp.java
+```
+
+**3. Script header:**
+
+```java
+///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 21
+//REPOS mavencentral,mycompany=https://nexus.mycompany.com/repository/maven-public@env.NEXUS_USER:env.NEXUS_PASS
+//DEPS com.mycompany:internal-sdk:2.1.0
+
+void main() {
+    System.out.println("Running in CI with private deps!");
+}
+```
+
+### Approach B: Generate settings.xml in Workflow
+
+Better when you have multiple scripts or when you want to keep scripts completely credential-free.
+
+```yaml
+# .github/workflows/run-script.yml
+name: Run JBang with Private Repo
+
+on: [push, workflow_dispatch]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JBang
+        uses: jbangdev/setup-jbang@main
+
+      - name: Cache JBang dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.jbang/cache
+          key: jbang-${{ runner.os }}-${{ hashFiles('**/*.java') }}
+          restore-keys: |
+            jbang-${{ runner.os }}-
+
+      # Generate settings.xml from secrets
+      # Using a dedicated step makes it easy to reuse across jobs
+      - name: Configure Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'SETTINGS_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <settings>
+            <servers>
+              <server>
+                <id>mycompany-releases</id>
+                <username>NEXUS_USER_PLACEHOLDER</username>
+                <password>NEXUS_PASS_PLACEHOLDER</password>
+              </server>
+              <server>
+                <id>mycompany-snapshots</id>
+                <username>NEXUS_USER_PLACEHOLDER</username>
+                <password>NEXUS_PASS_PLACEHOLDER</password>
+              </server>
+            </servers>
+            <profiles>
+              <profile>
+                <id>ci</id>
+                <repositories>
+                  <repository>
+                    <id>mycompany-releases</id>
+                    <url>NEXUS_URL_PLACEHOLDER/maven-releases</url>
+                    <releases><enabled>true</enabled></releases>
+                    <snapshots><enabled>false</enabled></snapshots>
+                  </repository>
+                  <repository>
+                    <id>mycompany-snapshots</id>
+                    <url>NEXUS_URL_PLACEHOLDER/maven-snapshots</url>
+                    <releases><enabled>false</enabled></releases>
+                    <snapshots><enabled>true</enabled></snapshots>
+                  </repository>
+                </repositories>
+              </profile>
+            </profiles>
+            <activeProfiles>
+              <activeProfile>ci</activeProfile>
+            </activeProfiles>
+          </settings>
+          SETTINGS_EOF
+
+          # Replace placeholders with actual secret values
+          # This avoids secret values appearing in the heredoc above
+          sed -i "s|NEXUS_USER_PLACEHOLDER|${{ secrets.NEXUS_USER }}|g" ~/.m2/settings.xml
+          sed -i "s|NEXUS_PASS_PLACEHOLDER|${{ secrets.NEXUS_PASS }}|g" ~/.m2/settings.xml
+          sed -i "s|NEXUS_URL_PLACEHOLDER|${{ secrets.NEXUS_URL }}|g"   ~/.m2/settings.xml
+
+      - name: Run script
+        run: jbang myapp.java
+
+      - name: Run another script (same repo config applies)
+        run: jbang process_data.java --input data.csv
+```
+
+> **Why the placeholder + sed approach?** GitHub Actions will automatically redact secret values from logs when they appear as `${{ secrets.X }}`. Using a heredoc directly with secrets embedded can sometimes cause issues with special characters (particularly `&`, `<`, `>`, `/` in passwords). The placeholder approach safely handles this.
+
+### Approach C: GitHub Packages
+
+When your private artifacts are published to GitHub Packages, you can use the built-in `GITHUB_TOKEN` — no extra secrets needed.
+
+```yaml
+# .github/workflows/run-script.yml
+name: Run with GitHub Packages
+
+on: [push]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    # Grant token permission to read packages
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JBang
+        uses: jbangdev/setup-jbang@main
+
+      - name: Configure GitHub Packages access
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << EOF
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${{ github.actor }}</username>
+                <password>${{ secrets.GITHUB_TOKEN }}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+      - name: Run script
+        run: jbang myapp.java
+```
+
+```java
+// Script pointing to GitHub Packages
+///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 21
+
+// The repo id 'github' must match the server id in settings.xml
+//REPOS mavencentral,github=https://maven.pkg.github.com/myorg/myrepo
+
+//DEPS com.myorg:shared-library:1.0.0
+
+void main() {
+    System.out.println("Using artifact from GitHub Packages!");
+}
+```
+
+### Approach D: Reusable Workflow for Multiple Repos
+
+If you have many repos that all need the same private artifact access, extract it into a reusable workflow:
+
+```yaml
+# .github/workflows/setup-maven-auth.yml (reusable workflow)
+name: Setup Maven Auth
+
+on:
+  workflow_call:
+    secrets:
+      NEXUS_URL:
+        required: true
+      NEXUS_USER:
+        required: true
+      NEXUS_PASS:
+        required: true
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings>
+            <servers>
+              <server>
+                <id>private</id>
+                <username>USER_PLACEHOLDER</username>
+                <password>PASS_PLACEHOLDER</password>
+              </server>
+            </servers>
+            <profiles>
+              <profile>
+                <id>private</id>
+                <repositories>
+                  <repository>
+                    <id>private</id>
+                    <url>URL_PLACEHOLDER</url>
+                  </repository>
+                </repositories>
+              </profile>
+            </profiles>
+            <activeProfiles><activeProfile>private</activeProfile></activeProfiles>
+          </settings>
+          EOF
+          sed -i "s|USER_PLACEHOLDER|${{ secrets.NEXUS_USER }}|g" ~/.m2/settings.xml
+          sed -i "s|PASS_PLACEHOLDER|${{ secrets.NEXUS_PASS }}|g" ~/.m2/settings.xml
+          sed -i "s|URL_PLACEHOLDER|${{ secrets.NEXUS_URL }}|g"   ~/.m2/settings.xml
+```
+
+```yaml
+# Any other workflow can now call it
+jobs:
+  run:
+    uses: ./.github/workflows/setup-maven-auth.yml
+    secrets:
+      NEXUS_URL:  ${{ secrets.NEXUS_URL }}
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+```
+
+---
+
+## Snapshot Dependencies
+
+Snapshots need special handling — they can change between builds, so you need to tell JBang where to find them and how often to check for updates.
+
+```java
+///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 21
+
+// Snapshot repo must be explicitly listed — not included in 'mavencentral'
+//REPOS mavencentral,snapshots=https://nexus.mycompany.com/repository/maven-snapshots@env.NEXUS_USER:env.NEXUS_PASS
+
+//DEPS com.mycompany:bleeding-edge-lib:2.0.0-SNAPSHOT
+
+void main() {
+    System.out.println("Using snapshot build!");
+}
+```
+
+```bash
+# Force JBang to re-check for newer snapshot version
+# (otherwise it uses cached version even if a newer snapshot exists)
+jbang --fresh myapp.java
+```
+
+In GitHub Actions, add `--fresh` to always pull the latest snapshot in CI:
+
+```yaml
+- name: Run with latest snapshot
+  env:
+    NEXUS_USER: ${{ secrets.NEXUS_USER }}
+    NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+  run: jbang --fresh myapp.java
+```
+
+---
+
+## Shell Wrapper Pattern
+
+For scripts that must validate credentials **before** attempting resolution, use a shell wrapper. This gives users a clear error message without waiting for a failed download:
+
+```bash
+#!/usr/bin/env bash
+# run-myapp.sh
+
+set -euo pipefail
+
+# ─── CREDENTIAL CHECK ───────────────────────────────────────────────────────
+missing=()
+
+[[ -z "${NEXUS_USER:-}" ]] && missing+=("NEXUS_USER")
+[[ -z "${NEXUS_PASS:-}" ]] && missing+=("NEXUS_PASS")
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "❌ Missing required environment variables:"
+    for var in "${missing[@]}"; do
+        echo "   export $var=<value>"
+    done
+    echo ""
+    echo "These are needed to access the private Maven repository."
+    echo "Ask your team lead for the correct values."
+    exit 1
+fi
+
+echo "✓ Credentials present"
+
+# ─── RUN ────────────────────────────────────────────────────────────────────
+exec jbang myapp.java "$@"
+```
+
+```bash
+chmod +x run-myapp.sh
+./run-myapp.sh --input data.csv
+```
+
+---
+
+## Multiple Repositories
+
+Real-world projects often need artifacts from several sources simultaneously:
+
+```java
+///usr/bin/env jbang "$0" "$@" ; exit $?
+//JAVA 21
+
+// ─── REPOS ──────────────────────────────────────────────────────────────────
+// JBang tries repos in the order listed.
+// Put the most frequently used first for faster resolution.
+//REPOS mavencentral,\
+//  releases=https://nexus.mycompany.com/repository/maven-releases@env.NEXUS_USER:env.NEXUS_PASS,\
+//  snapshots=https://nexus.mycompany.com/repository/maven-snapshots@env.NEXUS_USER:env.NEXUS_PASS,\
+//  partner=https://repo.partner-company.com/maven@env.PARTNER_USER:env.PARTNER_PASS
+
+// ─── DEPS ───────────────────────────────────────────────────────────────────
+// Public
+//DEPS com.google.code.gson:gson:2.10.1
+//DEPS info.picocli:picocli:4.7.5
+
+// Internal releases
+//DEPS com.mycompany:internal-sdk:2.1.0
+//DEPS com.mycompany:data-models:1.5.3
+
+// Internal snapshot
+//DEPS com.mycompany:new-feature-lib:3.0.0-SNAPSHOT
+
+// Partner library
+//DEPS com.partner:integration-kit:4.2.1
+
+void main() {
+    System.out.println("All deps resolved from mixed sources!");
+}
+```
+
+---
+
+## Troubleshooting
+
+### Dependency Not Found
+
+```bash
+# Step 1: Run with verbose to see what repos JBang is actually trying
+jbang --verbose myapp.java 2>&1 | grep -i "trying\|resolv\|error\|404\|401"
+
+# Step 2: Check your resolved classpath
+jbang info classpath myapp.java
+
+# Step 3: Force fresh resolution (clear any bad cache)
+jbang --fresh myapp.java
+
+# Step 4: Clear the entire dep cache and retry
+jbang cache clear --deps
+jbang myapp.java
+```
+
+### 401 Unauthorized
+
+This means JBang reached the repo but credentials were rejected.
+
+```bash
+# Verify env vars are actually set in current shell
+echo "User: '$NEXUS_USER'"
+echo "Pass length: ${#NEXUS_PASS}"
+
+# Test credentials directly with curl
+curl -u "$NEXUS_USER:$NEXUS_PASS" \
+  "https://nexus.mycompany.com/repository/maven-public/com/mycompany/internal-sdk/2.1.0/internal-sdk-2.1.0.pom"
+
+# Expected: XML content
+# Got 401: wrong credentials
+# Got 404: artifact doesn't exist at this path
+```
+
+### 403 Forbidden
+
+The credentials are valid but the account doesn't have permission to access that repo. Contact your Nexus/Artifactory administrator to check repository permissions for your service account.
+
+### SSL / Certificate Errors
+
+Common in corporate environments with internal CAs:
+
+```bash
+# Option 1: Point JBang to a custom truststore
+jbang --java-options "-Djavax.net.ssl.trustStore=/path/to/truststore.jks -Djavax.net.ssl.trustStorePassword=changeit" myapp.java
+
+# Option 2: Add to script header
+```
+
+```java
+//JAVA_OPTIONS -Djavax.net.ssl.trustStore=/etc/ssl/certs/company-truststore.jks
+//JAVA_OPTIONS -Djavax.net.ssl.trustStorePassword=changeit
+```
+
+### Artifact Resolves Locally But Not in CI
+
+Nine times out of ten, this is one of:
+1. Secret not added to the repository (check Settings → Secrets)
+2. Secret name typo (`NEXUS_PASS` vs `NEXUS_PASSWORD`)
+3. The CI service account has different permissions than your personal account
+4. `settings.xml` generated incorrectly (add a debug step to print it, masking the password)
+
+```yaml
+# Debug: print settings.xml with password masked
+- name: Debug Maven settings
+  run: |
+    sed 's/<password>.*<\/password>/<password>***<\/password>/g' ~/.m2/settings.xml
+```
+
+---
+
+## Security Checklist
+
+```
+✓  Credentials are in environment variables or settings.xml, never in script headers
+✓  settings.xml is not committed to version control (.gitignore it)
+✓  CI uses service accounts with minimal permissions (read-only to artifact repos)
+✓  GitHub secrets are scoped to the environments that need them
+✓  Rotate credentials regularly; update secrets when you do
+✓  Don't use --verbose in CI logs when credentials are involved (it can expose URLs with embedded tokens)
+✓  Use encrypted passwords in settings.xml on shared developer machines
+```
+
+---
+
+## Summary: Which Approach to Use
+
+| Situation | Recommended Approach | Why |
+|---|---|---|
+| Personal machine, one or two repos | `@env.` syntax in script header | Simple, explicit, no extra files |
+| Team-shared scripts, company Nexus | `~/.m2/settings.xml` | Scripts stay credential-free and shareable |
+| GitHub Actions, Nexus/Artifactory | Generate `settings.xml` in workflow step | Secrets stay in GitHub, scripts stay clean |
+| GitHub Actions, GitHub Packages | `settings.xml` with `GITHUB_TOKEN` | No extra secrets needed |
+| Unauthenticated internal mirror | `jbang config set repo.x ...` | Simplest option for auth-free repos |
+| Multiple scripts in same repo | Reusable workflow + `settings.xml` | Configure once, use everywhere |
